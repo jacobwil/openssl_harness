@@ -143,7 +143,7 @@ if __name__ == "__main__":
     #                                                          {'all_runs' : [(SIGTIME
     results_dict = defaultdict(dict)
 
-    for ciphersuite in ciphersuite_list:
+    for ciphersuite in tqdm.tqdm(ciphersuite_list, unit="ciphersuites"):
         for pem_file in pem_list:
             try:
                 # Start the TLS server
@@ -185,7 +185,8 @@ if __name__ == "__main__":
                 # The successful run above will be the first iteration
                 for __ in tqdm.tqdm(range(args.iterations - 1),
                                     desc=f"{ciphersuite} using {os.path.basename(pem_file)}",
-                                    initial=1, total=args.iterations):
+                                    initial=1, total=args.iterations,
+                                    leave=True):
                     s_client_completed_process = subprocess.run(s_client_command_split,
                                                                 stdin=subprocess.DEVNULL,
                                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
@@ -233,7 +234,6 @@ if __name__ == "__main__":
 print("done")
 
 results_dict['clocks_per_second'] = clocks_per_second
-print(dict(results_dict))
 
 with open("results.json", "w") as f:
     import json
