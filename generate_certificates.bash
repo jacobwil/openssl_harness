@@ -70,7 +70,7 @@ echo "Generating DSA certificates"
 dsa_size_list=( 1024 1280 1536 2048 3072 4096 )
 for size in "${dsa_size_list[@]}";
   do
-  echo "Creating an RSA cert for size ${size} -> dsa_${size}_server.cert.pem"
+  echo "Creating a DSA cert for size ${size} -> dsa_${size}_server.cert.pem"
   openssl req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
               -nodes -days 3653 -newkey dsa:<(openssl dsaparam "${size}") \
               -keyout "dsa_${size}_server.key.pem" -out "dsa_${size}_server.cert.pem" \
@@ -80,16 +80,16 @@ for size in "${dsa_size_list[@]}";
   rm "dsa_${size}_server.key.pem" "dsa_${size}_server.cert.pem"
 done
 
+popd
+
+pushd "${DHPARAM_OUTPUT_DIR}"
+echo "Generating Diffie-Hellman parameters"
+dh_size_list=( 1024 1280 1536 2048 3072 4096 )
+for size in "${dh_size_list[@]}";
+  do
+  echo "Creating a DH paramater file for size ${size} -> dh_${size}.pem"
+  openssl dhparam ${size} -out "dh_${size}.pem" \
+              ||  { echo -e "\n\n!!!!! Failed to make dh_${size}.pem\n\n"; continue; }
+done
+
 exit
-
-openssl req -x509 -sha256 -config openssl.conf -extensions 'server' -nodes -days 3653 -newkey rsa:2048 -keyout rsa_2048_server.key.pem -out rsa_2048_server.cert.pem
-cat rsa_2048_server.key.pem  rsa_2048_server.cert.pem > rsa_2048_server.pem
-# rm rsa_2048_server.key.pem  rsa_2048_server.cert.pem
-
-
-# run the openssl s_server
-openssl11 s_server  -no_ssl3  -key rsa_2048_server.pem -cert rsa_2048_server.pem -accept 44330 -WWW
-
-openssl11 s_server  -no_ssl3  -key ec_server.pem -cert ec_server.pem -accept 44330 -WWW
-
-alias openssl11='/usr/local/opt/openssl@1.1/bin/openssl'
