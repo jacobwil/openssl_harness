@@ -25,16 +25,18 @@ mkdir -p ${DHPARAM_OUTPUT_DIR}
 
 # Generate keys and certificates
 
-alias openssl="$1"
+OPENSSL_BIN="$(cd "$(dirname "$1")"; pwd)/$(basename "$1")"
 
 # Print out the openssl version
-openssl version
+${OPENSSL_BIN} version
 
-# Oakley curves cause issues. `openssl ecparam -list_curves` prints warnings too.
-curves_list_raw=$(openssl ecparam -list_curves | grep -oE '\S+:' | grep -oE '[^:]+')
+# Oakley curves cause issues. `${OPENSSL_BIN} ecparam -list_curves` prints warnings too.
+${OPENSSL_BIN} ecparam -list_curves | grep -oE '[^:]+ *:' | grep -oE '[^ :]+'
+curves_list_raw=$(${OPENSSL_BIN} ecparam -list_curves | grep -oE '[^:]+ *:' | grep -oE '[^ :]+')
 
 # Gotta be honest, bash arrays are ridiculous
 curves_list=($(echo ${curves_list_raw}))
+
 
 pushd "${CERT_OUTPUT_DIR}"
 
@@ -42,14 +44,16 @@ echo "Generating elliptic curve certificates"
 for curve_name in "${curves_list[@]}"
   do
   echo "Creating an EC cert for ${curve_name} -> ec_${curve_name}_server.pem"
-  openssl req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
-              -nodes -days 3653 -newkey ec:<(openssl ecparam -name "${curve_name}") \
+  ${OPENSSL_BIN} req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
+              -nodes -days 3653 -newkey ec:<(${OPENSSL_BIN} ecparam -name "${curve_name}") \
               -keyout "ec_${curve_name}_server.key.pem" -out "ec_${curve_name}_server.cert.pem" \
               ||  { echo -e "\n\n!!!!! Failed to make ec_${curve_name}_server.pem\n\n"; continue; }
   # Consolidate into a stacked pem
   cat "ec_${curve_name}_server.key.pem" "ec_${curve_name}_server.cert.pem" > "ec_${curve_name}_server.pem"
   rm "ec_${curve_name}_server.key.pem" "ec_${curve_name}_server.cert.pem"
 done
+echo ${curves_list_raw}
+echo ${curves_list[@]}
 
 echo "Generating RSA certificates"
 rsa_size_list=( 1024 1280 1536 2048 3072 4096 )
@@ -57,7 +61,7 @@ rsa_size_list=( 1024 1280 1536 2048 3072 4096 )
 for size in "${rsa_size_list[@]}";
   do
   echo "Creating an RSA cert for size ${size} -> rsa_${size}_server.cert.pem"
-  openssl req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
+  ${OPENSSL_BIN} req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
               -nodes -days 3653 -newkey "rsa:${size}" \
               -keyout "rsa_${size}_server.key.pem" -out "rsa_${size}_server.cert.pem" \
               ||  { echo -e "\n\n!!!!! Failed to make rsa_${size}_server.pem\n\n"; continue; }
@@ -71,8 +75,8 @@ dsa_size_list=( 1024 1280 1536 2048 3072 4096 )
 for size in "${dsa_size_list[@]}";
   do
   echo "Creating a DSA cert for size ${size} -> dsa_${size}_server.cert.pem"
-  openssl req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
-              -nodes -days 3653 -newkey dsa:<(openssl dsaparam "${size}") \
+  ${OPENSSL_BIN} req -x509 -sha256 -config openssl_req_conf.conf -extensions 'server' \
+              -nodes -days 3653 -newkey dsa:<(${OPENSSL_BIN} dsaparam "${size}") \
               -keyout "dsa_${size}_server.key.pem" -out "dsa_${size}_server.cert.pem" \
               ||  { echo -e "\n\n!!!!! Failed to make dsa_${size}_server.pem\n\n"; continue; }
   # Consolidate into a stacked pem
@@ -88,7 +92,7 @@ dh_size_list=( 1024 1280 1536 2048 3072 4096 )
 for size in "${dh_size_list[@]}";
   do
   echo "Creating a DH paramater file for size ${size} -> dh_${size}.pem"
-  openssl dhparam ${size} -out "dh_${size}.pem" \
+  ${OPENSSL_BIN} dhparam ${size} -out "dh_${size}.pem" \
               ||  { echo -e "\n\n!!!!! Failed to make dh_${size}.pem\n\n"; continue; }
 done
 
