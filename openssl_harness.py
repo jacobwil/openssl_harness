@@ -74,7 +74,7 @@ if __name__ == "__main__":
                            required=True,
                            type=str)
 
-    argparser.add_argument("-c", "--dhparam-directory",
+    argparser.add_argument("-d", "--dhparam-directory",
                            help="Path to a directory containing PEM files which each contain a DH parameter. "
                                 " Or a path to a single pem file. "
                                 "All filenames to be used must end in '.pem'",
@@ -147,100 +147,115 @@ if __name__ == "__main__":
     # TODO: Future feature (maybe): For each certificate figure out what type of public key and how large it is
     # that way we can cleanly note it in the JSON
 
-    # Format of this dictionary: results_dict['CIPHERSUITE']['CERTIFICATE_FILE'] -> {'success': boolean, 'timing':
+    # Format of this dictionary: results_dict['CIPHERSUITE']['CERTIFICATE_FILE']['DH_PARAM_FILE'] ->
+    #       {'success': boolean, 'timing': ………
     #                                                          {'all_runs' : [(SIGTIME
-    results_dict = defaultdict(dict)
+
+    # defaultdict of defaultdict of dict.
+    results_dict = defaultdict(lambda: defaultdict(dict))
 
     for ciphersuite in tqdm.tqdm(ciphersuite_list, unit="ciphersuites"):
-        for pem_cert_file in pem_cert_list:
-            try:
-                # Start the TLS server
-                s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
-                                   f"-cert {pem_cert_file} -accept {s_server_port} -WWW"
-                s_server_popen = subprocess.Popen(shlex.split(s_server_command),
-                                                  stdout=subprocess.PIPE,
-                                                  stderr=subprocess.PIPE)
+        for pem_cert_file in tqdm.tqdm(pem_cert_list, unit="certificate files"):
+            if not (ciphersuite.startswith("ECDH-") or ciphersuite.startswith("ECDHE-")):
+                this_dhparam_list = dhparam_list
+            else:
+                # If the dh paramaters aren't going to be used then skip it
+                this_dhparam_list = [dhparam_list[0]]
 
-                s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
-                                   f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
+            for dh_param_file in tqdm.tqdm(dhparam_list, desc=f"with ciphersuite {ciphersuite}", unit="dhparam files"):
+                # This level of loop is obviously going to generate a lot of nonsense when the ciphersuite is an ECDH
+                # ciphersuite. We'll be smarter later. For now let's just ignore it.
+                try:
+                    # Start the TLS server
+                    s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
+                                       f"-cert {pem_cert_file} -accept {s_server_port} " \
+                                       f"-dhparam {dh_param_file} -WWW"
+                    s_server_popen = subprocess.Popen(shlex.split(s_server_command),
+                                                      stdout=subprocess.PIPE,
+                                                      stderr=subprocess.PIPE)
 
-                s_client_command_split = shlex.split(s_client_command)
+                    s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
+                                       f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
 
-                # Trial run to make sure that this certificate/ciphersuite combo works
-                s_client_completed_process = subprocess.run(s_client_command_split,
-                                                            stdin=subprocess.DEVNULL,
-                                                            stdout=subprocess.PIPE, stderr=subprocess.PIPE
-                                                            )
+                    s_client_command_split = shlex.split(s_client_command)
 
-                # Make sure we got a success return code
-                if 0 != s_client_completed_process.returncode:
-                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                        'success': False,
-                        'message': f"Got non-0 return code: {s_client_completed_process.returncode}\n"
-                                   f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                                   f"stderr:{s_client_completed_process.stderr.decode()}"
-                    }
-                    continue
-
-                # Make sure the ciphersuite is what we expected
-                actual_ciphersuite = ciphersuite_matcher.findall(s_client_completed_process.stdout.decode())[0]
-                if ciphersuite != actual_ciphersuite:
-                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                        'success': False,
-                        'message': f"Got unexpected ciphersuite: {actual_ciphersuite}\n"
-                                   f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                                   f"stderr:{s_client_completed_process.stderr.decode()}"
-                    }
-                    continue
-
-                # The successful run above will be the first iteration
-                for __ in tqdm.tqdm(range(args.iterations - 1),
-                                    desc=f"{ciphersuite} using {os.path.basename(pem_cert_file)}",
-                                    initial=1, total=args.iterations,
-                                    leave=True):
+                    # Trial run to make sure that this certificate/ciphersuite combo works
                     s_client_completed_process = subprocess.run(s_client_command_split,
                                                                 stdin=subprocess.DEVNULL,
                                                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE
                                                                 )
-                    s_client_completed_process.check_returncode()
 
-                s_server_popen.terminate()
-                # capture stderr output
-                server_stderr = s_server_popen.stderr.read().decode()
-                signtimes_raw = signtime_matcher.findall(server_stderr)
-                signtimes = [int(e[0]) for e in signtimes_raw]
+                    # Make sure we got a success return code
+                    if 0 != s_client_completed_process.returncode:
+                        results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                            'success': False,
+                            'message': f"Got non-0 return code: {s_client_completed_process.returncode}\n"
+                                       f"stdout:{s_client_completed_process.stdout.decode()}\n"
+                                       f"stderr:{s_client_completed_process.stderr.decode()}"
+                        }
+                        continue
 
-                if not clocks_per_second:
-                    # We only need to capture this once
-                    clocks_per_second = signtimes_raw[0][1]
+                    # Make sure the ciphersuite is what we expected
+                    actual_ciphersuite = ciphersuite_matcher.findall(s_client_completed_process.stdout.decode())[0]
+                    if ciphersuite != actual_ciphersuite:
+                        results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                            'success': False,
+                            'message': f"Got unexpected ciphersuite: {actual_ciphersuite}\n"
+                                       f"stdout:{s_client_completed_process.stdout.decode()}\n"
+                                       f"stderr:{s_client_completed_process.stderr.decode()}"
+                        }
+                        continue
 
-                kxtimes_raw = kxtime_matcher.findall(server_stderr)
-                kxtimes = [int(e[0]) for e in kxtimes_raw]
-                kx_messages = list({e[2] for e in kxtimes_raw})
+                    # The successful run above will be the first iteration
+                    for __ in tqdm.tqdm(range(args.iterations - 1),
+                                        desc=f"{ciphersuite} using {os.path.basename(pem_cert_file)} "
+                                             f"and {os.path.basename(dh_param_file)}",
+                                        initial=1, total=args.iterations,
+                                        leave=True):
+                        s_client_completed_process = subprocess.run(s_client_command_split,
+                                                                    stdin=subprocess.DEVNULL,
+                                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                                                                    )
+                        s_client_completed_process.check_returncode()
 
-                results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                    'success': True,
-                    'message': "",
-                    "signature_clocks": signtimes,
-                    "signature_clocks_average": statistics.mean(signtimes),
-                    "signature_clocks_stddev": statistics.stdev(signtimes),
-                    "key_exchange_clocks": kxtimes,
-                    "key_exchange_clocks_average": statistics.mean(kxtimes),
-                    "key_exchange_clocks_stddev": statistics.stdev(kxtimes),
-                    "key_exchange_message_set": kx_messages
-                }
+                    s_server_popen.terminate()
+                    # capture stderr output
+                    server_stderr = s_server_popen.stderr.read().decode()
+                    signtimes_raw = signtime_matcher.findall(server_stderr)
+                    signtimes = [int(e[0]) for e in signtimes_raw]
 
-            except Exception as e:
-                tqdm.tqdm.write(f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception ")
-                results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                    'success': False,
-                    'message': f"Unexpected exception: {e}\n"
-                               f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                               f"stderr:{s_client_completed_process.stderr.decode()}"
-                }
-                continue
-            finally:
-                s_server_popen.kill()
+                    if not clocks_per_second:
+                        # We only need to capture this once
+                        clocks_per_second = signtimes_raw[0][1]
+
+                    kxtimes_raw = kxtime_matcher.findall(server_stderr)
+                    kxtimes = [int(e[0]) for e in kxtimes_raw]
+                    kx_messages = list({e[2] for e in kxtimes_raw})
+
+                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                        'success': True,
+                        'message': "",
+                        "signature_clocks": signtimes,
+                        "signature_clocks_average": statistics.mean(signtimes),
+                        "signature_clocks_stddev": statistics.stdev(signtimes),
+                        "key_exchange_clocks": kxtimes,
+                        "key_exchange_clocks_average": statistics.mean(kxtimes),
+                        "key_exchange_clocks_stddev": statistics.stdev(kxtimes),
+                        "key_exchange_message_set": kx_messages
+                    }
+
+                except Exception as e:
+                    tqdm.tqdm.write(
+                        f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception ")
+                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                        'success': False,
+                        'message': f"Unexpected exception: {e}\n"
+                                   f"stdout:{s_client_completed_process.stdout.decode()}\n"
+                                   f"stderr:{s_client_completed_process.stderr.decode()}"
+                    }
+                    continue
+                finally:
+                    s_server_popen.kill()
 
 print("done")
 
