@@ -140,7 +140,7 @@ if __name__ == "__main__":
     if args.certificates_directory.endswith(".pem"):
         dhparam_list = [args.certificates_directory]
     else:
-        dhparam_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
+        dhparam_list = list(glob.glob(os.path.join(args.dhparam_directory, "*.pem")))
     print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
 
     # OK, let's start evaluating these ciphersuites
