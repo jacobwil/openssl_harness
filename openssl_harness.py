@@ -156,13 +156,13 @@ if __name__ == "__main__":
 
     for ciphersuite in tqdm.tqdm(ciphersuite_list, unit="ciphersuites"):
         for pem_cert_file in tqdm.tqdm(pem_cert_list, unit="certificate files"):
-            if not (ciphersuite.startswith("ECDH-") or ciphersuite.startswith("ECDHE-")):
-                this_dhparam_list = dhparam_list
-            else:
+            if ciphersuite.startswith("ECDH-") or ciphersuite.startswith("ECDHE-"):
                 # If the dh paramaters aren't going to be used then skip it
                 this_dhparam_list = [dhparam_list[0]]
+            else:
+                this_dhparam_list = dhparam_list
 
-            for dh_param_file in tqdm.tqdm(dhparam_list, desc=f"with ciphersuite {ciphersuite}", unit="dhparam files"):
+            for dh_param_file in tqdm.tqdm(this_dhparam_list, desc=f"with ciphersuite {ciphersuite}", unit="dhparam files"):
                 # This level of loop is obviously going to generate a lot of nonsense when the ciphersuite is an ECDH
                 # ciphersuite. We'll be smarter later. For now let's just ignore it.
                 try:
