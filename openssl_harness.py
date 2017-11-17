@@ -74,6 +74,13 @@ if __name__ == "__main__":
                            required=True,
                            type=str)
 
+    argparser.add_argument("-c", "--dhparam-directory",
+                           help="Path to a directory containing PEM files which each contain a DH parameter. "
+                                " Or a path to a single pem file. "
+                                "All filenames to be used must end in '.pem'",
+                           required=True,
+                           type=str)
+
     argparser.add_argument("-p", "--port",
                            help="The port to use for the openssl s_server processes",
                            type=int,
@@ -124,35 +131,39 @@ if __name__ == "__main__":
 
     # Get the list of stacked PEMs
     if args.certificates_directory.endswith(".pem"):
-        pem_list = [args.certificates_directory]
+        pem_cert_list = [args.certificates_directory]
     else:
-        pem_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
-    print("Using these pem files: \n\t{}".format("\n\t".join(pem_list)))
+        pem_cert_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
+    print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
 
-    # Set up the templates
-    openssl_s_server_command_template = \
-        f"{args.openssl_binary} s_server -key {{pem_file}} -cert {{pem_file}} -accept {s_server_port} -WWW"
-
-    openssl_s_client_command_template = \
-        f"{openssl_binary} s_client -connect localhost:{s_server_port} -CAfile {{pem_file}} -cipher {{ciphersuite}}"
+    # Get the list of dhparams
+    if args.certificates_directory.endswith(".pem"):
+        dhparam_list = [args.certificates_directory]
+    else:
+        dhparam_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
+    print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
 
     # OK, let's start evaluating these ciphersuites
-    # TODO: Future feature: For each certificate figure out what type of public key and how large it is
+    # TODO: Future feature (maybe): For each certificate figure out what type of public key and how large it is
+    # that way we can cleanly note it in the JSON
 
     # Format of this dictionary: results_dict['CIPHERSUITE']['CERTIFICATE_FILE'] -> {'success': boolean, 'timing':
     #                                                          {'all_runs' : [(SIGTIME
     results_dict = defaultdict(dict)
 
     for ciphersuite in tqdm.tqdm(ciphersuite_list, unit="ciphersuites"):
-        for pem_file in pem_list:
+        for pem_cert_file in pem_cert_list:
             try:
                 # Start the TLS server
-                s_server_command = openssl_s_server_command_template.format(pem_file=pem_file)
+                s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
+                                   f"-cert {pem_cert_file} -accept {s_server_port} -WWW"
                 s_server_popen = subprocess.Popen(shlex.split(s_server_command),
                                                   stdout=subprocess.PIPE,
                                                   stderr=subprocess.PIPE)
 
-                s_client_command = openssl_s_client_command_template.format(pem_file=pem_file, ciphersuite=ciphersuite)
+                s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
+                                   f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
+
                 s_client_command_split = shlex.split(s_client_command)
 
                 # Trial run to make sure that this certificate/ciphersuite combo works
@@ -163,7 +174,7 @@ if __name__ == "__main__":
 
                 # Make sure we got a success return code
                 if 0 != s_client_completed_process.returncode:
-                    results_dict[ciphersuite][os.path.basename(pem_file)] = {
+                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
                         'success': False,
                         'message': f"Got non-0 return code: {s_client_completed_process.returncode}\n"
                                    f"stdout:{s_client_completed_process.stdout.decode()}\n"
@@ -174,7 +185,7 @@ if __name__ == "__main__":
                 # Make sure the ciphersuite is what we expected
                 actual_ciphersuite = ciphersuite_matcher.findall(s_client_completed_process.stdout.decode())[0]
                 if ciphersuite != actual_ciphersuite:
-                    results_dict[ciphersuite][os.path.basename(pem_file)] = {
+                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
                         'success': False,
                         'message': f"Got unexpected ciphersuite: {actual_ciphersuite}\n"
                                    f"stdout:{s_client_completed_process.stdout.decode()}\n"
@@ -184,7 +195,7 @@ if __name__ == "__main__":
 
                 # The successful run above will be the first iteration
                 for __ in tqdm.tqdm(range(args.iterations - 1),
-                                    desc=f"{ciphersuite} using {os.path.basename(pem_file)}",
+                                    desc=f"{ciphersuite} using {os.path.basename(pem_cert_file)}",
                                     initial=1, total=args.iterations,
                                     leave=True):
                     s_client_completed_process = subprocess.run(s_client_command_split,
@@ -207,7 +218,7 @@ if __name__ == "__main__":
                 kxtimes = [int(e[0]) for e in kxtimes_raw]
                 kx_messages = list({e[2] for e in kxtimes_raw})
 
-                results_dict[ciphersuite][os.path.basename(pem_file)] = {
+                results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
                     'success': True,
                     'message': "",
                     "signature_clocks": signtimes,
@@ -220,8 +231,8 @@ if __name__ == "__main__":
                 }
 
             except Exception as e:
-                print(f"While handling {ciphersuite} with {pem_file} encountered unexpected exception ")
-                results_dict[ciphersuite][os.path.basename(pem_file)] = {
+                tqdm.tqdm.write(f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception ")
+                results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
                     'success': False,
                     'message': f"Unexpected exception: {e}\n"
                                f"stdout:{s_client_completed_process.stdout.decode()}\n"
