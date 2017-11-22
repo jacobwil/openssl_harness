@@ -10,6 +10,7 @@ import shutil
 import statistics
 import subprocess
 import tqdm
+import traceback
 from collections import defaultdict
 
 signtime_matcher = re.compile(r"^SIGNTIME: (?P<clockcount>\d+) clocks \((?P<clocks_per_second>\d+) clocks per second\)",
@@ -38,6 +39,16 @@ def simplify_kxarg(input_kxarg: str) -> str:
         return "no_kxarg"
     else:
         return input_kxarg.split()[-1].strip()
+
+
+def str_if_not_invalid(in_object: object, default_str: str = "") -> str:
+    """
+    Lazy way to convert bad object references into empty string or default
+    """
+    try:
+        return str(in_object)
+    except:
+        return default_str
 
 
 def subprocess_run_get_stdout(command: str, check_return_code: bool = True) -> str:
@@ -213,6 +224,8 @@ if __name__ == "__main__":
     full_command_list = []
 
     for ciphersuite, ciphersuite_dict in tqdm.tqdm(ciphersuite_dicts.items(), unit="ciphersuites"):
+        results_dict[ciphersuite]['ciphersuite_info'] = ciphersuite_dict
+
         # Figure out the correct set of key exchange modifying arguments to use for the server
         if 'ECDH' in ciphersuite_dict['kxalg']:
             # if this is an EC ciphersuite then we're going to select the curve serverside
@@ -235,12 +248,16 @@ if __name__ == "__main__":
                                    f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
 
                 this_config_result_dict = {
-                    "s_client_command": s_client_command,
-                    "s_server_command": s_server_command
+                    "s_server_command": s_server_command,
+                    "s_client_command": s_client_command
                 }
                 # This level of loop is obviously going to generate a lot of nonsense when the ciphersuite is an ECDH
                 # ciphersuite. We'll be smarter later. For now let's just ignore it.
                 try:
+                    # Reset these in case we hit the except block
+                    server_stdout = ""
+                    server_stderr = ""
+                    s_client_completed_process = None
 
                     full_command_list.append((s_server_command, s_client_command))
 
@@ -258,22 +275,36 @@ if __name__ == "__main__":
 
                     # Make sure we got a success return code
                     if 0 != s_client_completed_process.returncode:
-                        this_config_result_dict['success'] = False
-                        this_config_result_dict['message']: \
-                            f"Got non-0 return code: {s_client_completed_process.returncode}\n" \
-                            f"stdout:{s_client_completed_process.stdout.decode()}\n" \
-                            f"stderr:{s_client_completed_process.stderr.decode()}"
+                        this_config_result_dict = {
+                            **this_config_result_dict,
+                            'success': False,
+                            'message': f"Got non-0 return code: {s_client_completed_process.returncode}\n"
+                                       f"client_stdout:"
+                                       f"{str_if_not_invalid(s_client_completed_process.stdout.decode())}\n"
+                                       f"client_stderr:"
+                                       f"{str_if_not_invalid(s_client_completed_process.stderr.decode())}\n"
+                                       f"server_stdout:{server_stdout}\n"
+                                       f"server_stderr:{server_stderr}"
+                        }
                         continue
 
                     # Make sure the ciphersuite is what we expected
                     actual_ciphersuite = ciphersuite_matcher.findall(s_client_completed_process.stdout.decode())[0]
                     if ciphersuite != actual_ciphersuite:
-                        this_config_result_dict['success'] = False
-                        this_config_result_dict['message']: \
-                            f"Got unexpected ciphersuite: {actual_ciphersuite}\n" \
-                            f"stdout:{s_client_completed_process.stdout.decode()}\n" \
-                            f"stderr:{s_client_completed_process.stderr.decode()}"
+                        this_config_result_dict = {
+                            **this_config_result_dict,
+                            'success': False,
+                            'message': f"Got unexpected ciphersuite: {actual_ciphersuite}\n"
+                                       f"client_stdout:"
+                                       f"{str_if_not_invalid(s_client_completed_process.stdout.decode())}\n"
+                                       f"client_stderr:"
+                                       f"{str_if_not_invalid(s_client_completed_process.stderr.decode())}\n"
+                                       f"server_stdout:{server_stdout}\n"
+                                       f"server_stderr:{server_stderr}"
+                        }
                         continue
+
+                    s_client_all_client_stdout = [s_client_completed_process.stdout.decode()]
 
                     # The successful run above will be the first iteration
                     for __ in tqdm.tqdm(range(args.iterations - 1),
@@ -286,9 +317,10 @@ if __name__ == "__main__":
                                                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE
                                                                     )
                         s_client_completed_process.check_returncode()
+                        s_client_all_client_stdout.append(s_client_completed_process.stdout.decode())
 
                     s_server_popen.terminate()
-                    # capture stderr output
+                    # capture stderr output from server
                     server_stderr = s_server_popen.stderr.read().decode()
                     signclocks_raw = signtime_matcher.findall(server_stderr)
                     signclocks = [int(e[0]) for e in signclocks_raw]
@@ -300,6 +332,18 @@ if __name__ == "__main__":
                     kxclocks_raw = kxtime_matcher.findall(server_stderr)
                     kxclocks = [int(e[0]) for e in kxclocks_raw]
                     kx_messages = list({e[2] for e in kxclocks_raw})
+
+                    # Get the bandwidth data from the client
+                    bandwidth_raw = bandwidth_match.findall("\n".join(s_client_all_client_stdout))
+                    # client_bytes_read_list_raw, client_bytes_sent_list_raw = [e[0], e[1] for e in bandwidth_raw]
+                    client_bytes_read_list = list(map(lambda x: int(x[0]), bandwidth_raw))
+                    client_bytes_sent_list = list(map(lambda x: int(x[1]), bandwidth_raw))
+
+                    if not len(bandwidth_raw) == len(signclocks) == len(kxclocks):
+                        raise Exception(f"Got different amounts of output for each metric"
+                                        f"bandwidth_raw:{len(bandwidth_raw)} "
+                                        f"signclocks:{len(signclocks)} "
+                                        f"kxclocks:{len(kxclocks)}")
 
                     this_config_result_dict = {
                         **this_config_result_dict,
@@ -315,26 +359,38 @@ if __name__ == "__main__":
                         "key_exchange_clocks_stddev": statistics.stdev(kxclocks),
                         "key_exchange_seconds_average": statistics.mean(kxclocks) / clocks_per_second,
                         "key_exchange_seconds_stddev": statistics.stdev(kxclocks) / clocks_per_second,
-                        "key_exchange_message_set": kx_messages
+                        "key_exchange_message_set": kx_messages,
+                        "client_bytes_read": client_bytes_read_list,
+                        "client_bytes_read_average": statistics.mean(client_bytes_read_list),
+                        "client_bytes_read_stddev": statistics.stdev(client_bytes_read_list),
+                        "client_bytes_sent": client_bytes_sent_list,
+                        "client_bytes_sent_average": statistics.mean(client_bytes_sent_list),
+                        "client_bytes_sent_stddev": statistics.stdev(client_bytes_sent_list)
                     }
 
                 except Exception as e:
                     tqdm.tqdm.write(
-                        f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception {e}")
-                    results_dict[ciphersuite][os.path.basename(pem_cert_file)][simplify_kxarg(this_kxarg)] = {
+                        f"While handling {ciphersuite} with {pem_cert_file} encountered "
+                        f"unexpected exception {traceback.format_exc()}"
+                    )
+                    this_config_result_dict = {
+                        **this_config_result_dict,
                         'success': False,
-                        'message': f"Unexpected exception: '{e}'\n"
-                                   f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                                   f"stderr:{s_client_completed_process.stderr.decode()}"
+                        'message': f"Unexpected exception: '{traceback.format_exc()}'\n"
+                                   f"client_stdout:{str_if_not_invalid(s_client_completed_process.stdout.decode())}\n"
+                                   f"client_stderr:{str_if_not_invalid(s_client_completed_process.stderr.decode())}\n"
+                                   f"server_stdout:{server_stdout}\n"
+                                   f"server_stderr:{server_stderr}"
                     }
                     continue
                 finally:
+                    results_dict[ciphersuite]['benchmark'][os.path.basename(pem_cert_file)][
+                        simplify_kxarg(this_kxarg)] = this_config_result_dict
                     if not s_server_popen:
                         print("s_server_popen doesn't exist, ran command {}".format(s_server_command))
                     else:
                         s_server_popen.kill()
 
-print("done")
 
 output_dict = {
     'benchmark_results': results_dict,
