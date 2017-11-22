@@ -12,15 +12,32 @@ import subprocess
 import tqdm
 from collections import defaultdict
 
-signtime_matcher = re.compile(r"SIGNTIME: (?P<clockcount>\d+) clocks \((?P<clocks_per_second>\d+) clocks per second\)")
-kxtime_matcher = re.compile(r"KXTIME: (?P<clockcount>\d+) clocks \((?P<clocks_per_second>\d+) clocks per second\)."
-                            r"*MSG: (?P<additional_msg>[^\n]+)?")
-# KXTIME: 86 clocks (1000000 clocks per second). MSG: kEECDH ECDH key exchange 80
+signtime_matcher = re.compile(r"^SIGNTIME: (?P<clockcount>\d+) clocks \((?P<clocks_per_second>\d+) clocks per second\)",
+                              re.MULTILINE)
+kxtime_matcher = re.compile(r"^KXTIME: (?P<clockcount>\d+) clocks \((?P<clocks_per_second>\d+) clocks per second\)."
+                            r"*MSG: (?P<additional_msg>[^\n]+)?", re.MULTILINE)
+
+bandwidth_match = re.compile(r"^SSL handshake has read (?P<readbytes>\d+) bytes and written (?P<writebytes>\d+) bytes",
+                             re.MULTILINE)
+
+# ECDHE-ECDSA-CHACHA20-POLY1305-OLD TLSv1.2 Kx=ECDH     Au=ECDSA Enc=ChaCha20(256) Mac=AEAD
+ciphersuite_list_extracter = re.compile("^(?P<ciphersuite>\S+) +(?P<protocolversion>(TLS|SSL)\S+) +Kx=(?P<kxalg>\S+) +"
+                                        "Au=(?P<authalg>\S+) +Enc=(?P<encalg>\S+) +Mac=(?P<macalg>\S+)",
+                                        re.MULTILINE)
 
 ciphersuite_matcher = re.compile(r"Cipher\s*:\s*(?P<ciphersuite>[A-Z0-9-]+)")
 protocol_matcher = re.compile(r"Protocol\s*:\s*(?P<protocol>(TLS|SSL)v\S+)")
 
+curve_matcher = re.compile(r"^\s*(?P<curve_name>[^ :]+)\s*:", re.MULTILINE)
+
 clocks_per_second = None
+
+
+def simplify_kxarg(input_kxarg: str) -> str:
+    if not input_kxarg or input_kxarg == '':
+        return "no_kxarg"
+    else:
+        return input_kxarg.split()[-1].strip()
 
 
 def subprocess_run_get_stdout(command: str, check_return_code: bool = True) -> str:
@@ -104,7 +121,59 @@ if __name__ == "__main__":
     print("Using openssl binary at '{}'".format(args.openssl_binary))
     print("\tVersion: {}".format(openssl_version))
 
-    ciphersuite_list_from_openssl = subprocess_run_get_stdout("{} ciphers".format(args.openssl_binary)).split(":")
+    # Get the list of stacked PEMs
+    if args.certificates_directory.endswith(".pem"):
+        pem_cert_list = [args.certificates_directory]
+    else:
+        pem_cert_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
+    # print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
+
+    # Get the list of dhparams
+    if args.certificates_directory.endswith(".pem"):
+        dhparam_list = [args.certificates_directory]
+    else:
+        dhparam_list = list(glob.glob(os.path.join(args.dhparam_directory, "*.pem")))
+
+    dhparam_arg_list = [" -dhparam {} ".format(dh_file) for dh_file in dhparam_list]
+
+    # Get the list of ciphersuites from openssl and parse the output into dicts.
+    ciphersuite_list_from_openssl_raw = subprocess_run_get_stdout(f"{args.openssl_binary} ciphers -v")
+    ciphersuite_dicts = {e['ciphersuite']: e.groupdict() for e in
+                         ciphersuite_list_extracter.finditer(ciphersuite_list_from_openssl_raw)}
+
+    ciphersuite_list_from_openssl = list(ciphersuite_dicts.keys())
+
+    curve_list_from_openssl_raw = subprocess_run_get_stdout(f"{args.openssl_binary} ecparam -list_curves")
+    curve_list_from_openssl = curve_matcher.findall(curve_list_from_openssl_raw)
+    ec_curve_arg_list_unfiltered = [" -named_curve {} ".format(curve) for curve in curve_list_from_openssl]
+
+    # Now we need to figure out which of these curves is supported for TLS
+    # Some of these curves aren't actually supported by openssl it seems
+    ec_curve_arg_list = list()  # Will hold valid TLS curves
+    pem_cert_file = "basic_certs/ec_server.pem"
+    for ec_curve_arg in ec_curve_arg_list_unfiltered:
+        try:
+            s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
+                               f"-cert {pem_cert_file} -accept {s_server_port} " \
+                               f"{ec_curve_arg} -WWW"
+            s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
+                               f"-CAfile {pem_cert_file}"
+
+            s_server_popen = subprocess.Popen(shlex.split(s_server_command),
+                                              stdout=subprocess.PIPE,
+                                              stderr=subprocess.PIPE)
+
+            s_client_completed_process = subprocess.run(shlex.split(s_client_command),
+                                                        stdin=subprocess.DEVNULL,
+                                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                                                        )
+            if s_client_completed_process.returncode == 0:
+                ec_curve_arg_list.append(ec_curve_arg)
+        finally:
+            s_server_popen.kill()
+
+    print(ec_curve_arg_list)
+    print(f"{len(ec_curve_arg_list)} of {len(ec_curve_arg_list_unfiltered)}")
 
     if not args.ciphersuite_list:
         # We weren't provided a list of ciphersuites so ask the openssl binary
@@ -129,20 +198,6 @@ if __name__ == "__main__":
     else:
         print(" ")
 
-    # Get the list of stacked PEMs
-    if args.certificates_directory.endswith(".pem"):
-        pem_cert_list = [args.certificates_directory]
-    else:
-        pem_cert_list = list(glob.glob(os.path.join(args.certificates_directory, "*.pem")))
-    print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
-
-    # Get the list of dhparams
-    if args.certificates_directory.endswith(".pem"):
-        dhparam_list = [args.certificates_directory]
-    else:
-        dhparam_list = list(glob.glob(os.path.join(args.dhparam_directory, "*.pem")))
-    print("Using these pem files: \n\t{}".format("\n\t".join(pem_cert_list)))
-
     # OK, let's start evaluating these ciphersuites
     # TODO: Future feature (maybe): For each certificate figure out what type of public key and how large it is
     # that way we can cleanly note it in the JSON
@@ -151,31 +206,47 @@ if __name__ == "__main__":
     #       {'success': boolean, 'timing': ………
     #                                                          {'all_runs' : [(SIGTIME
 
-    # defaultdict of defaultdict of dict.
-    results_dict = defaultdict(lambda: defaultdict(dict))
+    # defaultdict of defaultdict of defaultdict of dict.
+    results_dict = defaultdict(lambda: defaultdict(lambda: defaultdict(dict)))
+    s_server_popen = None
 
-    for ciphersuite in tqdm.tqdm(ciphersuite_list, unit="ciphersuites"):
+    full_command_list = []
+
+    for ciphersuite, ciphersuite_dict in tqdm.tqdm(ciphersuite_dicts.items(), unit="ciphersuites"):
+        # Figure out the correct set of key exchange modifying arguments to use for the server
+        if 'ECDH' in ciphersuite_dict['kxalg']:
+            # if this is an EC ciphersuite then we're going to select the curve serverside
+            this_kxarg_list = ec_curve_arg_list
+        elif 'DH' in ciphersuite_dict['kxalg']:
+            # otherwise, if it's classical DH then use the dhparam arg list
+            this_kxarg_list = dhparam_arg_list
+        else:
+            # If it is neither a DH nor ECDH ciphersuite then this argument doesn't matter so skip it
+            this_kxarg_list = ['']
+
         for pem_cert_file in tqdm.tqdm(pem_cert_list, unit="certificate files"):
-            if ciphersuite.startswith("ECDH-") or ciphersuite.startswith("ECDHE-"):
-                # If the dh paramaters aren't going to be used then skip it
-                this_dhparam_list = [dhparam_list[0]]
-            else:
-                this_dhparam_list = dhparam_list
+            for this_kxarg in tqdm.tqdm(this_kxarg_list, desc=f"with ciphersuite {ciphersuite}",
+                                        unit="Key Exchange Parameters"):
+                # Generate the commands
+                s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
+                                   f"-cert {pem_cert_file} -accept {s_server_port} " \
+                                   f"{this_kxarg} -WWW"
+                s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
+                                   f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
 
-            for dh_param_file in tqdm.tqdm(this_dhparam_list, desc=f"with ciphersuite {ciphersuite}", unit="dhparam files"):
+                this_config_result_dict = {
+                    "s_client_command": s_client_command,
+                    "s_server_command": s_server_command
+                }
                 # This level of loop is obviously going to generate a lot of nonsense when the ciphersuite is an ECDH
                 # ciphersuite. We'll be smarter later. For now let's just ignore it.
                 try:
-                    # Start the TLS server
-                    s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
-                                       f"-cert {pem_cert_file} -accept {s_server_port} " \
-                                       f"-dhparam {dh_param_file} -WWW"
+
+                    full_command_list.append((s_server_command, s_client_command))
+
                     s_server_popen = subprocess.Popen(shlex.split(s_server_command),
                                                       stdout=subprocess.PIPE,
                                                       stderr=subprocess.PIPE)
-
-                    s_client_command = f"{openssl_binary} s_client -connect localhost:{s_server_port} " \
-                                       f"-CAfile {pem_cert_file} -cipher {ciphersuite}"
 
                     s_client_command_split = shlex.split(s_client_command)
 
@@ -187,29 +258,27 @@ if __name__ == "__main__":
 
                     # Make sure we got a success return code
                     if 0 != s_client_completed_process.returncode:
-                        results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                            'success': False,
-                            'message': f"Got non-0 return code: {s_client_completed_process.returncode}\n"
-                                       f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                                       f"stderr:{s_client_completed_process.stderr.decode()}"
-                        }
+                        this_config_result_dict['success'] = False
+                        this_config_result_dict['message']: \
+                            f"Got non-0 return code: {s_client_completed_process.returncode}\n" \
+                            f"stdout:{s_client_completed_process.stdout.decode()}\n" \
+                            f"stderr:{s_client_completed_process.stderr.decode()}"
                         continue
 
                     # Make sure the ciphersuite is what we expected
                     actual_ciphersuite = ciphersuite_matcher.findall(s_client_completed_process.stdout.decode())[0]
                     if ciphersuite != actual_ciphersuite:
-                        results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
-                            'success': False,
-                            'message': f"Got unexpected ciphersuite: {actual_ciphersuite}\n"
-                                       f"stdout:{s_client_completed_process.stdout.decode()}\n"
-                                       f"stderr:{s_client_completed_process.stderr.decode()}"
-                        }
+                        this_config_result_dict['success'] = False
+                        this_config_result_dict['message']: \
+                            f"Got unexpected ciphersuite: {actual_ciphersuite}\n" \
+                            f"stdout:{s_client_completed_process.stdout.decode()}\n" \
+                            f"stderr:{s_client_completed_process.stderr.decode()}"
                         continue
 
                     # The successful run above will be the first iteration
                     for __ in tqdm.tqdm(range(args.iterations - 1),
                                         desc=f"{ciphersuite} using {os.path.basename(pem_cert_file)} "
-                                             f"and {os.path.basename(dh_param_file)}",
+                                             f"and {this_kxarg}",
                                         initial=1, total=args.iterations,
                                         leave=True):
                         s_client_completed_process = subprocess.run(s_client_command_split,
@@ -221,48 +290,60 @@ if __name__ == "__main__":
                     s_server_popen.terminate()
                     # capture stderr output
                     server_stderr = s_server_popen.stderr.read().decode()
-                    signtimes_raw = signtime_matcher.findall(server_stderr)
-                    signtimes = [int(e[0]) for e in signtimes_raw]
+                    signclocks_raw = signtime_matcher.findall(server_stderr)
+                    signclocks = [int(e[0]) for e in signclocks_raw]
 
                     if not clocks_per_second:
                         # We only need to capture this once
-                        clocks_per_second = signtimes_raw[0][1]
+                        clocks_per_second = int(signclocks_raw[0][1])
 
-                    kxtimes_raw = kxtime_matcher.findall(server_stderr)
-                    kxtimes = [int(e[0]) for e in kxtimes_raw]
-                    kx_messages = list({e[2] for e in kxtimes_raw})
+                    kxclocks_raw = kxtime_matcher.findall(server_stderr)
+                    kxclocks = [int(e[0]) for e in kxclocks_raw]
+                    kx_messages = list({e[2] for e in kxclocks_raw})
 
-                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                    this_config_result_dict = {
+                        **this_config_result_dict,
                         'success': True,
                         'message': "",
-                        "signature_clocks": signtimes,
-                        "signature_clocks_average": statistics.mean(signtimes),
-                        "signature_clocks_stddev": statistics.stdev(signtimes),
-                        "key_exchange_clocks": kxtimes,
-                        "key_exchange_clocks_average": statistics.mean(kxtimes),
-                        "key_exchange_clocks_stddev": statistics.stdev(kxtimes),
+                        "signature_clocks": signclocks,
+                        "signature_clocks_average": statistics.mean(signclocks),
+                        "signature_clocks_stddev": statistics.stdev(signclocks),
+                        "signature_seconds_average": statistics.mean(signclocks) / clocks_per_second,
+                        "signature_seconds_stddev": statistics.stdev(signclocks) / clocks_per_second,
+                        "key_exchange_clocks": kxclocks,
+                        "key_exchange_clocks_average": statistics.mean(kxclocks),
+                        "key_exchange_clocks_stddev": statistics.stdev(kxclocks),
+                        "key_exchange_seconds_average": statistics.mean(kxclocks) / clocks_per_second,
+                        "key_exchange_seconds_stddev": statistics.stdev(kxclocks) / clocks_per_second,
                         "key_exchange_message_set": kx_messages
                     }
 
                 except Exception as e:
                     tqdm.tqdm.write(
-                        f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception ")
-                    results_dict[ciphersuite][os.path.basename(pem_cert_file)] = {
+                        f"While handling {ciphersuite} with {pem_cert_file} encountered unexpected exception {e}")
+                    results_dict[ciphersuite][os.path.basename(pem_cert_file)][simplify_kxarg(this_kxarg)] = {
                         'success': False,
-                        'message': f"Unexpected exception: {e}\n"
+                        'message': f"Unexpected exception: '{e}'\n"
                                    f"stdout:{s_client_completed_process.stdout.decode()}\n"
                                    f"stderr:{s_client_completed_process.stderr.decode()}"
                     }
                     continue
                 finally:
-                    s_server_popen.kill()
+                    if not s_server_popen:
+                        print("s_server_popen doesn't exist, ran command {}".format(s_server_command))
+                    else:
+                        s_server_popen.kill()
 
 print("done")
 
-results_dict['clocks_per_second'] = clocks_per_second
+output_dict = {
+    'benchmark_results': results_dict,
+    'clocks_per_second': clocks_per_second
+}
 
 with open("results.json", "w") as f:
     import json
 
-    json.dump(results_dict, f)
+    json.dump(output_dict, f)
+
 # done
