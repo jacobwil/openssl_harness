@@ -2,6 +2,8 @@
 
 import argparse
 import glob
+import gzip
+import json
 import os
 import pprint
 import re
@@ -95,6 +97,16 @@ if __name__ == "__main__":
                            type=str,
                            default=None)
 
+    argparser.add_argument("-m", "--curve-list",
+                           help="List of curves to try, ':' separated",
+                           type=str,
+                           default=None)
+
+    argparser.add_argument("-f", "--filter-curve-certs",
+                           help="Filter the list of ec certs using the --curve-list argument",
+                           default=False,
+                           action="store_true")
+
     argparser.add_argument("-c", "--certificates-directory",
                            help="Path to a directory containing PEM files which each contain both a certificate and "
                                 "unencrypted private key. Or a path to a single pem file. "
@@ -156,7 +168,40 @@ if __name__ == "__main__":
 
     curve_list_from_openssl_raw = subprocess_run_get_stdout(f"{args.openssl_binary} ecparam -list_curves")
     curve_list_from_openssl = curve_matcher.findall(curve_list_from_openssl_raw)
-    ec_curve_arg_list_unfiltered = [" -named_curve {} ".format(curve) for curve in curve_list_from_openssl]
+
+    if args.curve_list:
+        raw_arg_curve_list = args.curve_list.split(":")
+
+        not_supported = set(raw_arg_curve_list).difference(curve_list_from_openssl)
+
+        if not_supported:
+            print(" ")
+            print("WARNING: The following curves are not supported "
+                  "by this version of openssl and will be ignored: {}".format(" ".join(not_supported)))
+            print(" ")
+
+        curve_list = list(set(raw_arg_curve_list).intersection(curve_list_from_openssl))
+
+        if args.filter_curve_certs:
+            # Selected curve set
+            curve_set = set(curve_list)
+
+            # Now if we need to filter the certs we need to break out the ec and non-ec segments
+            # Depend on filename for now. Someday parse `openssl x509`output
+            non_ec_certs = [cert for cert in pem_cert_list if not cert.startswith("ec_")]
+            ec_certs = [cert for cert in pem_cert_list if cert.startswith("ec_")]
+
+            # Filter the ec certs now
+            ec_certs_filtered = list(filter(lambda n: set(n.split("_")) & curve_set, ec_certs))
+            pem_cert_list = non_ec_certs + ec_certs_filtered
+
+            print(f"Filtered to cert list "
+                  f"(dropped {len(non_ec_certs + ec_certs) - len(pem_cert_list)}) "
+                  f"{pem_cert_list}")
+    else:
+        curve_list = curve_list_from_openssl
+
+    ec_curve_arg_list_unfiltered = [" -named_curve {} ".format(curve) for curve in curve_list]
 
     # Now we need to figure out which of these curves is supported for TLS
     # Some of these curves aren't actually supported by openssl it seems
@@ -200,7 +245,10 @@ if __name__ == "__main__":
                   "by this version of openssl and will be ignored: {}".format(" ".join(not_supported)))
             print(" ")
 
-            ciphersuite_list = list(set(ciphersuite_list).intersection(ciphersuite_list_from_openssl))
+        ciphersuite_list = list(set(ciphersuite_list).intersection(ciphersuite_list_from_openssl))
+
+        # Also filter the ciphersuite dictionaries
+        ciphersuite_dicts = {k: v for k, v in ciphersuite_dicts.items() if k in ciphersuite_list}
 
     print("Examining these ciphersuites: ")
     print("\t{}".format(" ".join(ciphersuite_list[:5])), end="")
@@ -237,8 +285,20 @@ if __name__ == "__main__":
             # If it is neither a DH nor ECDH ciphersuite then this argument doesn't matter so skip it
             this_kxarg_list = ['']
 
-        for pem_cert_file in tqdm.tqdm(pem_cert_list, unit="certificate files"):
-            for this_kxarg in tqdm.tqdm(this_kxarg_list, desc=f"with ciphersuite {ciphersuite}",
+        # Filter certificates
+        # possible values  {'DH', 'DSS', 'ECDH', 'ECDSA', 'PSK', 'RSA', 'SRP'}
+        authalg = ciphersuite_dict['authalg']
+        if 'RSA' == authalg:
+            this_cert_list = filter(lambda c: "rsa" in c, pem_cert_list)
+        elif 'ECDSA' == authalg:
+            this_cert_list = filter(lambda c: "ec" in c, pem_cert_list)
+        elif 'DSS' == authalg:
+            this_cert_list = filter(lambda c: "dsa" in c, pem_cert_list)
+        else:
+            this_cert_list = pem_cert_list
+
+        for pem_cert_file in tqdm.tqdm(this_cert_list, unit="certificate files", desc=f"{ciphersuite[:10]}"):
+            for this_kxarg in tqdm.tqdm(this_kxarg_list, desc=f"{pem_cert_file} with ciphersuite {ciphersuite}",
                                         unit="Key Exchange Parameters"):
                 # Generate the commands
                 s_server_command = f"{args.openssl_binary} s_server -key {pem_cert_file} " \
@@ -386,11 +446,14 @@ if __name__ == "__main__":
                 finally:
                     results_dict[ciphersuite]['benchmark'][os.path.basename(pem_cert_file)][
                         simplify_kxarg(this_kxarg)] = this_config_result_dict
+
                     if not s_server_popen:
                         print("s_server_popen doesn't exist, ran command {}".format(s_server_command))
                     else:
                         s_server_popen.kill()
 
+            with open("checkpoint.json.gz", "wb") as f:
+                f.write(json.dumps(results_dict).encode())
 
 output_dict = {
     'benchmark_results': results_dict,
@@ -398,8 +461,6 @@ output_dict = {
 }
 
 with open("results.json", "w") as f:
-    import json
-
     json.dump(output_dict, f)
 
 # done
